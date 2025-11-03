@@ -7721,6 +7721,159 @@ for shape in [(1,), ()]:
         ):
             self.assertEqual(param.grad, checkpoint_param.grad)
 
+    @parametrize("use_reentrant", [True, False])
+    def test_checkpoint_with_func_kwargs(self, use_reentrant):
+        """Test checkpoint with func_kwargs parameter for both reentrant and non-reentrant modes"""
+
+        def fn(x, scale=1.0, bias=0.0):
+            return x * scale + bias
+
+        x = torch.tensor([2.0], requires_grad=True)
+
+        # Test with func_kwargs
+        y = checkpoint(
+            fn, x, use_reentrant=use_reentrant, func_kwargs={"scale": 3.0, "bias": 1.0}
+        )
+        expected = torch.tensor([7.0])  # 2.0 * 3.0 + 1.0 = 7.0
+        self.assertEqual(y, expected)
+
+        # Test backward
+        y.sum().backward()
+        expected_grad = torch.tensor([3.0])  # derivative w.r.t x is scale
+        self.assertEqual(x.grad, expected_grad)
+
+    @parametrize("use_reentrant", [True, False])
+    def test_checkpoint_with_func_kwargs_complex(self, use_reentrant):
+        """Test checkpoint with complex function having multiple kwargs"""
+
+        def complex_fn(
+            x,
+            t,
+            encoder_hidden_states=None,
+            controlnet_cond=None,
+            conditioning_scale=1.0,
+            guess_mode=False,
+        ):
+            result = x + t
+            if encoder_hidden_states is not None:
+                result = result + encoder_hidden_states
+            if controlnet_cond is not None:
+                result = result + controlnet_cond * conditioning_scale
+            return result
+
+        x = torch.tensor([1.0], requires_grad=True)
+        t = torch.tensor([0.5], requires_grad=True)
+        encoder_hidden_states = torch.tensor([0.2], requires_grad=True)
+        controlnet_cond = torch.tensor([0.3], requires_grad=True)
+
+        kwargs = {
+            "encoder_hidden_states": encoder_hidden_states,
+            "controlnet_cond": controlnet_cond,
+            "conditioning_scale": 2.0,
+            "guess_mode": False,
+        }
+
+        result = checkpoint(
+            complex_fn, x, t, use_reentrant=use_reentrant, func_kwargs=kwargs
+        )
+        # Expected: 1.0 + 0.5 + 0.2 + 0.3*2.0 = 2.3
+        expected = torch.tensor([2.3])
+        self.assertEqual(result, expected)
+
+        # Test backward
+        result.sum().backward()
+        self.assertIsNotNone(x.grad)
+        self.assertIsNotNone(t.grad)
+        self.assertIsNotNone(encoder_hidden_states.grad)
+        self.assertIsNotNone(controlnet_cond.grad)
+
+    @parametrize("use_reentrant", [True, False])
+    def test_checkpoint_with_mixed_args_and_func_kwargs(self, use_reentrant):
+        """Test checkpoint with both positional args and func_kwargs"""
+
+        def fn(x, y, scale=1.0, bias=0.0):
+            return x * y * scale + bias
+
+        x = torch.tensor([2.0], requires_grad=True)
+        y = torch.tensor([3.0], requires_grad=True)
+
+        result = checkpoint(
+            fn,
+            x,
+            y,
+            use_reentrant=use_reentrant,
+            func_kwargs={"scale": 2.0, "bias": 1.0},
+        )
+        # Expected: 2.0 * 3.0 * 2.0 + 1.0 = 13.0
+        expected = torch.tensor([13.0])
+        self.assertEqual(result, expected)
+
+        result.sum().backward()
+        self.assertIsNotNone(x.grad)
+        self.assertIsNotNone(y.grad)
+
+    def test_checkpoint_func_kwargs_backward_compatibility(self):
+        """Test that existing code without func_kwargs still works"""
+
+        def fn(x):
+            return x * 2
+
+        x = torch.tensor([2.0], requires_grad=True)
+
+        # Old style - should still work
+        y = checkpoint(fn, x, use_reentrant=False)
+        expected = torch.tensor([4.0])
+        self.assertEqual(y, expected)
+
+        y.sum().backward()
+        expected_grad = torch.tensor([2.0])
+        self.assertEqual(x.grad, expected_grad)
+
+    @parametrize("use_reentrant", [True, False])
+    def test_checkpoint_func_kwargs_with_tensor_values(self, use_reentrant):
+        """Test that func_kwargs can contain tensor values and gradients flow correctly"""
+
+        def fn(x, weight=None, bias=None):
+            result = x * 2
+            if weight is not None:
+                result = result * weight
+            if bias is not None:
+                result = result + bias
+            return result
+
+        x = torch.tensor([2.0], requires_grad=True)
+        weight = torch.tensor([3.0], requires_grad=True)
+        bias = torch.tensor([1.0], requires_grad=True)
+
+        y = checkpoint(
+            fn,
+            x,
+            use_reentrant=use_reentrant,
+            func_kwargs={"weight": weight, "bias": bias},
+        )
+        expected = torch.tensor([13.0])  # (2.0 * 2) * 3.0 + 1.0 = 13.0
+        self.assertEqual(y, expected)
+
+        y.sum().backward()
+        self.assertIsNotNone(x.grad)
+        self.assertIsNotNone(weight.grad)
+        self.assertIsNotNone(bias.grad)
+
+    def test_checkpoint_func_kwargs_type_validation(self):
+        """Test that func_kwargs type is validated"""
+
+        def fn(x, scale=1.0):
+            return x * scale
+
+        x = torch.tensor([2.0], requires_grad=True)
+
+        # Should raise TypeError if func_kwargs is not a dict
+        with self.assertRaisesRegex(TypeError, "func_kwargs must be a dict"):
+            checkpoint(fn, x, use_reentrant=False, func_kwargs=[("scale", 2.0)])
+
+        with self.assertRaisesRegex(TypeError, "func_kwargs must be a dict"):
+            checkpoint(fn, x, use_reentrant=False, func_kwargs="invalid")
+
     def test_callback_adds_callback(self):
         called = [0]
 

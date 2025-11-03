@@ -223,7 +223,7 @@ def _get_autocast_kwargs(device_type="cuda"):
 class CheckpointFunction(torch.autograd.Function):
     @staticmethod
     # pyrefly: ignore [bad-override]
-    def forward(ctx, run_function, preserve_rng_state, *args):
+    def forward(ctx, run_function, preserve_rng_state, func_kwargs, *args):
         check_backward_validity(args)
         ctx.run_function = run_function
         ctx.preserve_rng_state = preserve_rng_state
@@ -257,10 +257,20 @@ class CheckpointFunction(torch.autograd.Function):
             else:
                 ctx.inputs.append(arg)
 
+        # Handle func_kwargs - save non-tensor kwargs, track tensor kwargs
+        ctx.func_kwargs = {}
+        ctx.func_kwargs_tensor_keys = []
+        for key, value in func_kwargs.items():
+            if torch.is_tensor(value):
+                tensor_inputs.append(value)
+                ctx.func_kwargs_tensor_keys.append(key)
+            else:
+                ctx.func_kwargs[key] = value
+
         ctx.save_for_backward(*tensor_inputs)
 
         with torch.no_grad():
-            outputs = run_function(*args)
+            outputs = run_function(*args, **func_kwargs)
         return outputs
 
     @staticmethod
@@ -278,8 +288,14 @@ class CheckpointFunction(torch.autograd.Function):
         tensors = ctx.saved_tensors
 
         # Fill in inputs with appropriate saved tensors.
+        num_args_tensors = len(tensor_indices)
         for i, idx in enumerate(tensor_indices):
             inputs[idx] = tensors[i]
+
+        # Reconstruct func_kwargs with tensor values
+        func_kwargs = dict(ctx.func_kwargs)
+        for i, key in enumerate(ctx.func_kwargs_tensor_keys):
+            func_kwargs[key] = tensors[num_args_tensors + i]
 
         # Stash the surrounding rng state, and mimic the state that was
         # present at this time during forward.  Restore the surrounding state
@@ -300,7 +316,7 @@ class CheckpointFunction(torch.autograd.Function):
                 device_type=ctx.device_type, **ctx.device_autocast_kwargs
             ) if torch.amp.is_autocast_available(ctx.device_type) else contextlib.nullcontext()
             with torch.enable_grad(), device_autocast_ctx, torch.amp.autocast("cpu", **ctx.cpu_autocast_kwargs):  # type: ignore[attr-defined]
-                outputs = ctx.run_function(*detached_inputs)
+                outputs = ctx.run_function(*detached_inputs, **func_kwargs)
 
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
@@ -323,7 +339,8 @@ class CheckpointFunction(torch.autograd.Function):
             for inp in detached_inputs
         )
 
-        return (None, None) + grads
+        # Return: (None for run_function, None for preserve_rng_state, None for func_kwargs, *grads for args)
+        return (None, None, None) + grads
 
 
 def noop_context_fn():
@@ -444,6 +461,11 @@ def checkpoint(
             functionality, such as working as expected with
             ``torch.autograd.grad`` and support for keyword arguments input into
             the checkpointed function.
+        func_kwargs(dict, optional): A dictionary of keyword arguments to pass
+            to the checkpointed function. This allows passing keyword arguments
+            to the function being checkpointed, making the code cleaner when
+            dealing with functions that have many optional parameters.
+            Default: ``None`` (empty dict).
         context_fn(Callable, optional): A callable returning a tuple of two
             context managers. The function and its recomputation will be run
             under the first and second context managers respectively.
@@ -468,6 +490,15 @@ def checkpoint(
 
     Returns:
         Output of running :attr:`function` on :attr:`*args`
+
+    Example:
+        >>> # xdoctest: +SKIP
+        >>> def fn(x, scale=1.0, bias=0.0):
+        ...     return x * scale + bias
+        >>> x = torch.randn(10, requires_grad=True)
+        >>> # Pass keyword arguments via func_kwargs
+        >>> y = checkpoint(fn, x, use_reentrant=False,
+        ...                func_kwargs={"scale": 2.0, "bias": 1.0})
     """
     if use_reentrant is None:
         warnings.warn(
@@ -483,6 +514,13 @@ def checkpoint(
 
     # Hack to mix *args with **kwargs in a python 2.7-compliant way
     preserve = kwargs.pop("preserve_rng_state", True)
+    func_kwargs = kwargs.pop("func_kwargs", None)
+    if func_kwargs is None:
+        func_kwargs = {}
+    elif not isinstance(func_kwargs, dict):
+        raise TypeError(
+            f"func_kwargs must be a dict, got {type(func_kwargs).__name__}"
+        )
     if kwargs and use_reentrant:
         raise ValueError(
             "Unexpected keyword arguments: " + ",".join(arg for arg in kwargs)
@@ -494,14 +532,16 @@ def checkpoint(
                 "Passing `context_fn` or `debug` is only supported when "
                 "use_reentrant=False."
             )
-        return CheckpointFunction.apply(function, preserve, *args)
+        return CheckpointFunction.apply(function, preserve, func_kwargs, *args)
     else:
+        # Merge func_kwargs into kwargs for non-reentrant mode
+        merged_kwargs = {**kwargs, **func_kwargs}
         gen = _checkpoint_without_reentrant_generator(
-            function, preserve, context_fn, determinism_check, debug, early_stop, *args, **kwargs
+            function, preserve, context_fn, determinism_check, debug, early_stop, *args, **merged_kwargs
         )
         # Runs pre-forward logic
         next(gen)
-        ret = function(*args, **kwargs)
+        ret = function(*args, **merged_kwargs)
         # Runs post-forward logic
         try:
             next(gen)
